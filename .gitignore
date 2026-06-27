@@ -1,5 +1,5 @@
 # Input data and generated reports (contain customer PII — do not commit)
-may_inputdata/
+input/
 output/
 *.xlsx
 *.csv
