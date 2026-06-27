@@ -18,7 +18,7 @@ stores/
 
 ```bash
 # For KUDBI:
-python reconcile.py --store KUDBI --inputs-dir ./may_inputdata
+python reconcile.py --store KUDBI --inputs-dir ./input
 
 # For a new store (after creating stores/KANTHA.json):
 python reconcile.py --store KANTHA --inputs-dir ./kantha_april
