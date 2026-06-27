@@ -1,0 +1,7 @@
+{
+  "store_name": "TEMPLATE",
+  "product_costs": {
+    "_INSTRUCTIONS_": "Add 'Parent Product Name': cost_in_INR entries below. Parent name = the lineitem name BEFORE the ' - ' separator (e.g. 'Juhi Heavy Fancy Pair with Dupatta set'). Products without a cost here will appear in the output with a yellow-highlighted blank cost cell.",
+    "EXAMPLE Product Name Here": 450
+  }
+}
