@@ -14,6 +14,7 @@ Inputs (in --inputs-dir):
   shopify_orders.csv
   bluedart*.xlsx   (one or more)
   expressfly.csv
+  delivery*.xlsx   (optional, one or more — Delhivery-style tracking export)
 
 Output:
   /mnt/user-data/outputs/<MONTH>_<YEAR>_<STORE>_ORDERS.xlsx
@@ -32,6 +33,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl import load_workbook
+from openpyxl.utils.datetime import from_excel
 
 
 ORDERS_COLUMNS = [
@@ -79,6 +81,26 @@ def load_store_config(store_name, stores_dir):
     return cfg
 
 
+def register_new_products(store_name, stores_dir, product_names):
+    """
+    Add any parent products not yet in stores/<STORE>.json with a null cost, so
+    they show up as yellow (needs-a-cost) cells in the workbook. Existing
+    entries — including underscore-keyed instructions — are left untouched.
+
+    Returns the list of newly added product names.
+    """
+    cfg_path = Path(stores_dir) / f"{store_name}.json"
+    raw = json.loads(cfg_path.read_text())
+    costs = raw.setdefault("product_costs", {})
+    new = [p for p in sorted(product_names) if p and p not in costs]
+    if not new:
+        return []
+    for p in new:
+        costs[p] = None
+    cfg_path.write_text(json.dumps(raw, indent=2) + "\n")
+    return new
+
+
 # ----- helpers ---------------------------------------------------- #
 
 def strip_hash(v):
@@ -110,6 +132,12 @@ def parse_date(v):
         return None
     if isinstance(v, datetime):
         return v
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        # Excel serial date (delivery*.xlsx stores pickup date as a raw number)
+        try:
+            return from_excel(v)
+        except (ValueError, OverflowError):
+            return None
     s = str(v).strip()
     if not s:
         return None
@@ -177,6 +205,77 @@ def build_other_status(expressfly_csv):
     df["Order Date"] = df["Order Date"].apply(parse_date)
     df = df.dropna(subset=["Order Number"]).drop_duplicates(subset=["Order Number"], keep="first")
     return df.values.tolist()
+
+
+def build_delivery_status(delivery_paths):
+    """
+    Read delivery*.xlsx (Delhivery-style export) into the same row shape as
+    build_other_status():
+      [Order Number, Order Status, Airwaybill Number, Courier Name,
+       Order Date, Service Provider Comment, No of Attempt, Zone]
+
+    Columns used: 'order #', 'current status' ('Delivered' / 'RTO' / ...),
+    'waybill number', 'pickup date', 'last scan remarks', 'attempt count'.
+    """
+    rows = []
+    seen = set()
+    for p in delivery_paths:
+        wb = load_workbook(p, data_only=True)
+        ws = wb[wb.sheetnames[0]]
+        header = {}
+        for c in range(1, ws.max_column + 1):
+            h = clean_str(ws.cell(1, c).value)
+            if h:
+                header[h.lower()] = c
+        need = ["order #", "current status", "waybill number"]
+        missing = [k for k in need if k not in header]
+        if missing:
+            raise ValueError(f"{p} missing columns: {missing}")
+
+        def cell(r, key):
+            c = header.get(key)
+            return ws.cell(r, c).value if c else None
+
+        for r in range(2, ws.max_row + 1):
+            ord_no = strip_hash(cell(r, "order #"))
+            if ord_no is None:
+                continue
+            if ord_no in seen:
+                continue
+            seen.add(ord_no)
+            attempts = pd.to_numeric(cell(r, "attempt count"), errors="coerce")
+            rows.append([
+                ord_no,
+                clean_str(cell(r, "current status")),
+                strip_hash(cell(r, "waybill number")),
+                "DELHIVERY",
+                parse_date(cell(r, "pickup date")),
+                clean_str(cell(r, "last scan remarks")),
+                None if pd.isna(attempts) else int(attempts),
+                None,
+            ])
+    return rows
+
+
+def merge_other_status(expressfly_rows, delivery_rows):
+    """
+    Combine expressfly + delivery rows, one row per order number.
+    A definite status (Delivered / RTO) beats an in-flight one, otherwise the
+    first source seen (expressfly) wins.
+    """
+    def definite(status):
+        return is_other_delivered(status) or is_other_rto(status)
+
+    merged = {}
+    order = []
+    for row in list(expressfly_rows) + list(delivery_rows):
+        n = row[0]
+        if n not in merged:
+            merged[n] = row
+            order.append(n)
+        elif definite(row[1]) and not definite(merged[n][1]):
+            merged[n] = row
+    return [merged[n] for n in order]
 
 
 def build_orders(shopify_csv):
@@ -773,6 +872,7 @@ def main():
     shopify_csv = indir / "shopify_orders.csv"
     expressfly_csv = indir / "expressfly.csv"
     bluedart_files = sorted(indir.glob("bluedart*.xlsx"))
+    delivery_files = sorted(indir.glob("delivery*.xlsx"))
 
     for path, label in [(shopify_csv, "shopify_orders.csv"),
                         (expressfly_csv, "expressfly.csv")]:
@@ -785,12 +885,29 @@ def main():
     print(f"  shopify   : {shopify_csv.name}")
     print(f"  expressfly: {expressfly_csv.name}")
     print(f"  bluedart  : {[p.name for p in bluedart_files]}")
+    print(f"  delivery  : {[p.name for p in delivery_files] or 'none'}")
 
     # Read data
     shopify_df_raw = pd.read_csv(shopify_csv, dtype=str)
     orders_df, raw_fulfilled, totals = build_orders(shopify_csv)
     bd_rows = build_bluedart_status(bluedart_files)
-    other_rows = build_other_status(expressfly_csv)
+    expressfly_rows = build_other_status(expressfly_csv)
+    delivery_rows = build_delivery_status(delivery_files) if delivery_files else []
+    other_rows = merge_other_status(expressfly_rows, delivery_rows)
+    if delivery_files:
+        print(f"  delivery rows: {len(delivery_rows)}"
+              f" (Other status rows after merge: {len(other_rows)})")
+
+    # Register products seen this month but missing from the store config
+    seen_products = {
+        parent_product(v) for v in raw_fulfilled["Lineitem name"].dropna().tolist()
+    }
+    new_products = register_new_products(args.store, args.stores_dir, seen_products)
+    if new_products:
+        print(f"  new products added to stores/{args.store}.json (cost = null):")
+        for p in new_products:
+            print(f"    - {p}")
+        cfg = load_store_config(args.store, args.stores_dir)
 
     total_orders = shopify_df_raw["Name"].apply(strip_hash).dropna().nunique()
     fulfilled_orders = orders_df["Name"].dropna().nunique()
