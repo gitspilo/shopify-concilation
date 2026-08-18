@@ -23,6 +23,7 @@ Output:
 import argparse
 import calendar
 import json
+import re
 import sys
 from collections import defaultdict
 from datetime import datetime
@@ -114,6 +115,30 @@ def strip_hash(v):
     return s
 
 
+ORDER_SUFFIX_RE = re.compile(r"^(\d+)-\S+$")
+
+
+def normalize_order_no(v):
+    """Collapse a courier's re-ship suffix back onto the base order number.
+
+    Bluedart writes a re-shipped consignment as '79653-CLONE' (and
+    '-CLONE-CLONE' on a second re-ship); the Other couriers use '-V1', '-03',
+    '-A'. Shopify never suffixes its order names, so the suffixed form matches
+    no order at all and the shipment goes uncounted.
+    """
+    n = strip_hash(v)
+    if isinstance(n, str):
+        m = ORDER_SUFFIX_RE.match(n.strip())
+        if m:
+            return int(m.group(1))
+    return n
+
+
+def _pickup_key(v):
+    """Sortable pickup date; parse_date falls back to a raw string or None."""
+    return v if isinstance(v, datetime) else datetime.min
+
+
 def parent_product(lineitem_name):
     if lineitem_name is None or (isinstance(lineitem_name, float) and pd.isna(lineitem_name)):
         return None
@@ -176,7 +201,7 @@ def build_bluedart_status(bluedart_paths):
         if missing:
             raise ValueError(f"{p} missing columns: {missing}")
         for r in range(2, ws.max_row + 1):
-            ord_no = strip_hash(ws.cell(r, idx["Reference No"]).value)
+            ord_no = normalize_order_no(ws.cell(r, idx["Reference No"]).value)
             if ord_no is None:
                 continue
             wb_no = ws.cell(r, idx["WayBill No"]).value
@@ -194,17 +219,35 @@ def build_bluedart_status(bluedart_paths):
     return rows
 
 
+def dedupe_other_rows(rows):
+    """One row per order number for an Other-courier source.
+
+    Re-ship suffixes collapse several rows onto the same order, so keeping
+    whichever row was read first would let file order decide the status. Same
+    rule as the Bluedart side: a definite outcome (Delivered / RTO) beats one
+    still in flight, then the latest pickup wins.
+    """
+    best = {}
+    for row in rows:
+        n, status, date_v = row[0], row[1], row[4]
+        definite = is_other_delivered(status) or is_other_rto(status)
+        rank = (definite, _pickup_key(date_v))
+        if n not in best or rank > best[n][0]:
+            best[n] = (rank, row)
+    return [row for _rank, row in best.values()]
+
+
 def build_other_status(expressfly_csv):
     df = pd.read_csv(expressfly_csv, dtype=str)
     keep = ["Order Number", "Order Status", "Airwaybill Number", "Courier Name",
             "Order Date", "Service Provider Comment", "No of Attempt", "Zone"]
     df = df[keep].copy()
-    df["Order Number"] = df["Order Number"].apply(strip_hash)
+    df["Order Number"] = df["Order Number"].apply(normalize_order_no)
     df["Airwaybill Number"] = df["Airwaybill Number"].apply(strip_hash)
     df["No of Attempt"] = pd.to_numeric(df["No of Attempt"], errors="coerce").astype("Int64")
     df["Order Date"] = df["Order Date"].apply(parse_date)
-    df = df.dropna(subset=["Order Number"]).drop_duplicates(subset=["Order Number"], keep="first")
-    return df.values.tolist()
+    df = df.dropna(subset=["Order Number"])
+    return dedupe_other_rows(df.values.tolist())
 
 
 def build_delivery_status(delivery_paths):
@@ -218,7 +261,6 @@ def build_delivery_status(delivery_paths):
     'waybill number', 'pickup date', 'last scan remarks', 'attempt count'.
     """
     rows = []
-    seen = set()
     for p in delivery_paths:
         wb = load_workbook(p, data_only=True)
         ws = wb[wb.sheetnames[0]]
@@ -237,12 +279,9 @@ def build_delivery_status(delivery_paths):
             return ws.cell(r, c).value if c else None
 
         for r in range(2, ws.max_row + 1):
-            ord_no = strip_hash(cell(r, "order #"))
+            ord_no = normalize_order_no(cell(r, "order #"))
             if ord_no is None:
                 continue
-            if ord_no in seen:
-                continue
-            seen.add(ord_no)
             attempts = pd.to_numeric(cell(r, "attempt count"), errors="coerce")
             rows.append([
                 ord_no,
@@ -254,7 +293,7 @@ def build_delivery_status(delivery_paths):
                 None if pd.isna(attempts) else int(attempts),
                 None,
             ])
-    return rows
+    return dedupe_other_rows(rows)
 
 
 def merge_other_status(expressfly_rows, delivery_rows):
@@ -330,10 +369,18 @@ def build_orders(shopify_csv):
 def is_bluedart_delivered(status):
     return status == "SHIPMENT DELIVERED"
 
+# Bluedart statuses that are terminal returns but contain neither "RTO" nor
+# "RETURN" in the text, so the substring test below would miss them.
+BLUEDART_RTO_STATUSES = {
+    "DELIVERED BACK TO SHIPPER",
+}
+
 def is_bluedart_rto(status):
     if not status:
         return False
     s = str(status).upper()
+    if s in BLUEDART_RTO_STATUSES:
+        return True
     return "RTO" in s or "RETURN" in s
 
 def is_other_delivered(status):
@@ -341,6 +388,25 @@ def is_other_delivered(status):
 
 def is_other_rto(status):
     return status and "RTO" in str(status)
+
+
+def resolve_bluedart_status(bd_rows):
+    """One Bluedart status per order number.
+
+    A re-ship leaves several rows on the same order once '-CLONE' references
+    collapse onto their base. Picking the last row read would make the answer
+    depend on file order, so resolve it: a definite outcome (Delivered / RTO)
+    beats one still in flight, and among rows of equal standing the latest
+    pickup wins — the order takes the fate of its final shipment.
+    """
+    best = {}
+    for row in bd_rows:
+        n, status, _wb, pu = row[0], row[1], row[2], row[3]
+        definite = is_bluedart_delivered(status) or is_bluedart_rto(status)
+        rank = (definite, _pickup_key(pu))
+        if n not in best or rank > best[n][0]:
+            best[n] = (rank, status)
+    return {n: status for n, (_rank, status) in best.items()}
 
 
 def classify_orders(orders_df, bd_rows, other_rows, product_costs):
@@ -352,13 +418,14 @@ def classify_orders(orders_df, bd_rows, other_rows, product_costs):
       - AND the order is NOT found in Bluedart OR Other status sheets
     => treat it as Other-Delivered (i.e. assumed delivered).
     """
-    bd_index = {r[0]: r[1] for r in bd_rows}   # order_no -> status
+    bd_index = resolve_bluedart_status(bd_rows)
     other_index = {r[0]: r[1] for r in other_rows}
 
     bd_delivered = set()
     bd_rto = set()
     other_delivered = set()
     other_rto = set()
+    unknown = set()
     paid_no_status_assumed_delivered = set()
 
     fulfilled_names = set(orders_df["Name"].dropna().tolist())
@@ -382,14 +449,45 @@ def classify_orders(orders_df, bd_rows, other_rows, product_costs):
             if n in paid_orders:
                 paid_no_status_assumed_delivered.add(n)
                 other_delivered.add(n)
+            else:
+                # COD order still in flight (or with no record at all). It is
+                # neither delivered nor RTO yet, so it gets its own bucket
+                # instead of silently vanishing from the percentages.
+                unknown.add(n)
 
     return {
         "bd_delivered": bd_delivered,
         "bd_rto": bd_rto,
         "other_delivered": other_delivered,
         "other_rto": other_rto,
+        "unknown": unknown,
         "paid_no_status_assumed_delivered": paid_no_status_assumed_delivered,
     }
+
+
+def build_payment_split(orders_df, classification):
+    """Delivered / RTO / Unknown order counts split by payment mode.
+
+    Prepaid = Shopify 'Financial Status' == 'paid'; everything else is COD
+    (Shopify leaves COD orders as 'pending' until the courier remits). RTO
+    behaves so differently across the two that a blended RTO% hides the only
+    number worth acting on.
+    """
+    paid = set(orders_df.loc[orders_df["Financial Status"] == "paid",
+                             "Name"].dropna().tolist())
+    delivered = classification["bd_delivered"] | classification["other_delivered"]
+    rto = classification["bd_rto"] | classification["other_rto"]
+    unknown = classification["unknown"]
+
+    split = {}
+    for label, in_mode in (("Prepaid", lambda n: n in paid),
+                           ("COD", lambda n: n not in paid)):
+        split[label] = {
+            "delivered": sum(1 for n in delivered if in_mode(n)),
+            "rto": sum(1 for n in rto if in_mode(n)),
+            "unknown": sum(1 for n in unknown if in_mode(n)),
+        }
+    return split
 
 
 def build_product_cost(raw_fulfilled, classification, product_costs):
@@ -697,10 +795,18 @@ def write_pnl(ws, pnl_rows):
 
 
 def write_delivery_analysis(ws, rollup_len, pc_start=3):
+    """Unit-level delivery split per parent product.
+
+    RTO% and Unknown% are measured against Total Qty from their own unit
+    counts, not derived as 100-Delivery%. Delivery% + RTO% + Unknown% == 100
+    only because the three unit buckets partition Total Qty; column L makes
+    that visible instead of assuming it.
+    """
     ws["B1"] = "Data derived based on delivered (quantities / units)"
     ws["B1"].font = HEADER_FONT
     headers = ["Product Name", "Total Qty", "Bluedart Qty", "Other Qty",
-               "Delivered Qty", "Delivery%", "RTO%"]
+               "Delivered Qty", "RTO Qty", "Unknown Qty",
+               "Delivery%", "RTO%", "Unknown%", "Check"]
     for i, h in enumerate(headers, start=2):
         ws.cell(2, i, h).font = HEADER_FONT
 
@@ -708,23 +814,33 @@ def write_delivery_analysis(ws, rollup_len, pc_start=3):
         r = 3 + i
         pc_r = pc_start + i
         ws.cell(r, 2, f"=ProductCost!G{pc_r}")
-        ws.cell(r, 3, None)  # filled by populate_total_qty
+        ws.cell(r, 3, None)  # C Total Qty   - filled by populate_unit_counts
         ws.cell(r, 4, f"=ProductCost!H{pc_r}")
         ws.cell(r, 5, f"=ProductCost!I{pc_r}")
         ws.cell(r, 6, f"=SUM(D{r}:E{r})")
-        ws.cell(r, 7, f"=IFERROR(F{r}/C{r}*100,0)")
-        ws.cell(r, 8, f"=100-G{r}")
+        ws.cell(r, 7, None)  # G RTO Qty     - filled by populate_unit_counts
+        ws.cell(r, 8, None)  # H Unknown Qty - filled by populate_unit_counts
+        ws.cell(r, 9, f"=IFERROR(F{r}/C{r}*100,0)")
+        ws.cell(r, 10, f"=IFERROR(G{r}/C{r}*100,0)")
+        ws.cell(r, 11, f"=IFERROR(H{r}/C{r}*100,0)")
+        ws.cell(r, 12, f"=I{r}+J{r}+K{r}")
 
     total_row = 3 + rollup_len
     if rollup_len:
         last = total_row - 1
         ws.cell(total_row, 2, "TOTAL").font = HEADER_FONT
-        ws.cell(total_row, 3, f"=SUM(C3:C{last})").font = HEADER_FONT
-        ws.cell(total_row, 4, f"=SUM(D3:D{last})").font = HEADER_FONT
-        ws.cell(total_row, 5, f"=SUM(E3:E{last})").font = HEADER_FONT
+        for col in (3, 4, 5, 7, 8):
+            c = get_column_letter(col)
+            ws.cell(total_row, col, f"=SUM({c}3:{c}{last})").font = HEADER_FONT
         ws.cell(total_row, 6, f"=SUM(D{total_row}:E{total_row})").font = HEADER_FONT
-        ws.cell(total_row, 7, f"=IFERROR(F{total_row}/C{total_row}*100,0)").font = HEADER_FONT
-        ws.cell(total_row, 8, f"=100-G{total_row}").font = HEADER_FONT
+        ws.cell(total_row, 9,
+                f"=IFERROR(F{total_row}/C{total_row}*100,0)").font = HEADER_FONT
+        ws.cell(total_row, 10,
+                f"=IFERROR(G{total_row}/C{total_row}*100,0)").font = HEADER_FONT
+        ws.cell(total_row, 11,
+                f"=IFERROR(H{total_row}/C{total_row}*100,0)").font = HEADER_FONT
+        ws.cell(total_row, 12,
+                f"=I{total_row}+J{total_row}+K{total_row}").font = HEADER_FONT
 
     # ----- Orders vs Units reconciliation note -----
     # DeliveryAnalysis counts UNITS; Reconciliation counts ORDERS. The gap is
@@ -737,15 +853,29 @@ def write_delivery_analysis(ws, rollup_len, pc_start=3):
     ws.cell(note_row + 2, 2, "Difference (multi-unit orders)").font = HEADER_FONT
     ws.cell(note_row + 2, 6, f"=F{note_row}-F{note_row + 1}").font = HEADER_FONT
 
-    widths = {2: 55, 3: 12, 4: 12, 5: 12, 6: 16, 7: 12, 8: 10}
+    widths = {2: 55, 3: 12, 4: 12, 5: 12, 6: 16, 7: 12, 8: 14,
+              9: 12, 10: 10, 11: 12, 12: 10}
     for c, w in widths.items():
         ws.column_dimensions[get_column_letter(c)].width = w
     ws.freeze_panes = "C3"
 
 
-def populate_total_qty(ws_da, raw_fulfilled, rollup_products):
+def populate_unit_counts(ws_da, raw_fulfilled, rollup_products, classification):
+    """Fill DeliveryAnalysis C (Total Qty), G (RTO Qty) and H (Unknown Qty).
+
+    Counted from the same line items and the same order buckets that feed
+    ProductCost columns H/I, so Delivered + RTO + Unknown reconciles to Total
+    per parent product.
+    """
+    rto = classification["bd_rto"] | classification["other_rto"]
+    unknown = classification["unknown"]
+
     parent_qty = defaultdict(int)
+    parent_rto = defaultdict(int)
+    parent_unknown = defaultdict(int)
+
     for _, row in raw_fulfilled.iterrows():
+        name = row.get("Name")
         variant = row.get("Lineitem name")
         try:
             qty = int(row.get("Lineitem quantity") or 0)
@@ -753,12 +883,77 @@ def populate_total_qty(ws_da, raw_fulfilled, rollup_products):
             qty = 0
         if not variant or qty == 0:
             continue
-        parent_qty[parent_product(variant)] += qty
+        parent = parent_product(variant)
+        parent_qty[parent] += qty
+        if name in rto:
+            parent_rto[parent] += qty
+        elif name in unknown:
+            parent_unknown[parent] += qty
+
     for i, pname in enumerate(rollup_products):
-        ws_da.cell(3 + i, 3, parent_qty.get(pname, 0))
+        r = 3 + i
+        ws_da.cell(r, 3, parent_qty.get(pname, 0))
+        ws_da.cell(r, 7, parent_rto.get(pname, 0))
+        ws_da.cell(r, 8, parent_unknown.get(pname, 0))
+
+    # A parent with no delivered units never enters the ProductCost rollup, so
+    # its RTO/Unknown units would be invisible on this sheet. Surface it rather
+    # than letting the columns silently disagree with Total Qty.
+    orphans = {p: q for p, q in parent_qty.items() if p not in set(rollup_products)}
+    if orphans:
+        print("  WARNING: parents with no delivered units, omitted from "
+              f"DeliveryAnalysis: {orphans}")
 
 
-def write_reconciliation(ws, totals, totals_cls, orders_df, pc_total_row):
+def write_payment_split(ws, payment_split, start_row=35):
+    """Prepaid vs COD delivery/RTO block.
+
+    Percentages are on the settled base (delivered + RTO) so the in-flight
+    Unknown column cannot flatter either mode.
+    """
+    ws.cell(start_row, 4, "Payment Mode Split").font = HEADER_FONT
+
+    hdr = start_row + 1
+    headers = ["Orders", "Delivered", "RTO", "Unknown", "Settled",
+               "Delivery% (settled)", "RTO% (settled)", "Share of Orders%"]
+    for i, h in enumerate(headers, start=5):
+        ws.cell(hdr, i, h).font = HEADER_FONT
+
+    for i, label in enumerate(("Prepaid", "COD")):
+        r = hdr + 1 + i
+        d = payment_split[label]
+        ws.cell(r, 4, label)
+        ws.cell(r, 5, f"=SUM(F{r}:H{r})")   # Orders
+        ws.cell(r, 6, d["delivered"])
+        ws.cell(r, 7, d["rto"])
+        ws.cell(r, 8, d["unknown"])
+        ws.cell(r, 9, f"=F{r}+G{r}")        # Settled
+        ws.cell(r, 10, f"=IFERROR(F{r}/I{r}*100,0)")
+        ws.cell(r, 11, f"=IFERROR(G{r}/I{r}*100,0)")
+        ws.cell(r, 12, "=IFERROR(E{r}/$E$4*100,0)".format(r=r))
+
+    tot = hdr + 3
+    ws.cell(tot, 4, "TOTAL").font = HEADER_FONT
+    for col in range(5, 10):
+        c = get_column_letter(col)
+        ws.cell(tot, col, f"=SUM({c}{hdr + 1}:{c}{tot - 1})").font = HEADER_FONT
+    ws.cell(tot, 10, f"=IFERROR(F{tot}/I{tot}*100,0)").font = HEADER_FONT
+    ws.cell(tot, 11, f"=IFERROR(G{tot}/I{tot}*100,0)").font = HEADER_FONT
+    ws.cell(tot, 12, f"=IFERROR(E{tot}/$E$4*100,0)").font = HEADER_FONT
+
+    # TOTAL here must equal Fullfield Orders; if it does not, an order escaped
+    # every bucket and the percentages above are being computed on a short base.
+    ws.cell(tot + 1, 4, "Check vs Fullfield Orders").font = HEADER_FONT
+    ws.cell(tot + 1, 5, f"=E{tot}-E4").font = HEADER_FONT
+
+    for col, w in {5: 12, 6: 12, 7: 10, 8: 12, 9: 12,
+                   10: 20, 11: 18, 12: 18}.items():
+        cur = ws.column_dimensions[get_column_letter(col)].width or 0
+        ws.column_dimensions[get_column_letter(col)].width = max(cur, w)
+
+
+def write_reconciliation(ws, totals, totals_cls, orders_df, pc_total_row,
+                         payment_split):
     """
     Reconciliation dashboard with the new auto-filled fields:
       I24 = total_sales_raw  (was manual)
@@ -770,6 +965,8 @@ def write_reconciliation(ws, totals, totals_cls, orders_df, pc_total_row):
     bd_rto = totals_cls["bd_rto"]
     other_delivered = totals_cls["other_delivered"]
     other_rto = totals_cls["other_rto"]
+    unknown = totals_cls["unknown"]
+    unknown_amt = totals_cls["unknown_amt"]
     bd_delivered_amt = totals_cls["bd_delivered_amt"]
     bd_rto_amt = totals_cls["bd_rto_amt"]
     other_delivered_amt = totals_cls["other_delivered_amt"]
@@ -793,6 +990,12 @@ def write_reconciliation(ws, totals, totals_cls, orders_df, pc_total_row):
     ws["D9"] = "Other RTO"
     ws["E9"] = other_rto
     ws["F9"] = other_rto_amt
+    # Fulfilled orders that are neither delivered nor RTO: still in transit, not
+    # picked up, or with no courier record at all. Without this row E6:E9 falls
+    # short of E4 and Delivery% + RTO% does not add up to 100.
+    ws["D10"] = "Unknown / In Transit"
+    ws["E10"] = unknown
+    ws["F10"] = unknown_amt
 
     ws["E11"] = "=SUM(E6:E10)"
     ws["F11"] = "=SUM(F6:F10)"
@@ -816,6 +1019,20 @@ def write_reconciliation(ws, totals, totals_cls, orders_df, pc_total_row):
     ws["D26"] = "Total Shiping Avg";               ws["E26"] = "=IFERROR(-(I8+I9)/(E6+E7+E8+E9),0)"
     ws["D27"] = "Bluedart Total Shiping Avg";      ws["E27"] = "=IFERROR(-I8/(E6+E8),0)"
     ws["D28"] = "Other Total Shiping Avg";         ws["E28"] = "=IFERROR(-I9/(E7+E9),0)"
+    # Completes the Delivery% / RTO% split: E16 + E17 + E29 = 100.
+    ws["D29"] = "Unknown / In Transit%"; ws["E29"] = "=IFERROR(E10/E4*100,0)"
+    ws["D30"] = "Status Coverage Check"; ws["E30"] = "=E16+E17+E29"
+
+    # ----- Settled basis -----
+    # E16/E17 divide by every fulfilled order, including those still in flight,
+    # which drags RTO% down by however much was undelivered at export time.
+    # Dividing by settled orders only makes months comparable.
+    ws["D31"] = "Settled Orders (excl Unknown)"; ws["E31"] = "=E6+E7+E8+E9"
+    ws["D32"] = "Delivery% (settled)"; ws["E32"] = "=IFERROR((E6+E7)/E31*100,0)"
+    ws["D33"] = "RTO% (settled)";      ws["E33"] = "=IFERROR((E8+E9)/E31*100,0)"
+
+    # ----- Payment mode split -----
+    write_payment_split(ws, payment_split, start_row=35)
 
     # ----- Middle block (P&L) -----
     ws["H6"]  = "Net Sales";          ws["I6"]  = "=F6+F7"
@@ -834,7 +1051,15 @@ def write_reconciliation(ws, totals, totals_cls, orders_df, pc_total_row):
     ws["J17"] = "=E6+E7";             ws["K17"] = "=IFERROR(I17/J17,0)"
     ws["H18"] = "Cash Expense";       ws["I18"] = None; ws["I18"].fill = YELLOW
     ws["H19"] = "Net ";               ws["I19"] = "=SUM(I17:I18)"
-    ws["H20"] = "RTO ( 0 x 500 )";    ws["I20"] = "=(E8+E9)*500"
+
+    # Reference figure only — deliberately not deducted from Gross or Net.
+    # RTO'd stock comes back sellable, so expensing it would write off
+    # inventory still on hand. Rate per RTO = average product cost per piece
+    # off the ProductCost TOTAL row, so it tracks the actual product mix.
+    ws["H21"] = "RTO Cost";           ws["I21"] = "=(E8+E9)*M22"
+    ws["M21"] = "Rate per RTO"
+    ws["M22"] = (f"=IFERROR(ProductCost!L{pc_total_row}"
+                 f"/ProductCost!J{pc_total_row},0)")
 
     # NEW: auto-filled total sales fields
     ws["H24"] = "Totale Sales";              ws["I24"] = totals["total_sales_raw"]
@@ -843,7 +1068,7 @@ def write_reconciliation(ws, totals, totals_cls, orders_df, pc_total_row):
     ws["H27"] = "ROAS";                      ws["I27"] = "=IFERROR(I24/I26,0)"
     ws["H28"] = "After Cancellletion ROAS";  ws["I28"] = "=IFERROR(I25/I26,0)"
 
-    for col in "DHIJKL":
+    for col in "DHIJKLMN":
         ws.column_dimensions[col].width = 22
 
 
@@ -945,10 +1170,12 @@ def main():
         "bd_rto": len(classification["bd_rto"]),
         "other_delivered": len(classification["other_delivered"]),
         "other_rto": len(classification["other_rto"]),
+        "unknown": len(classification["unknown"]),
         "bd_delivered_amt": sum_amt(classification["bd_delivered"]),
         "bd_rto_amt": sum_amt(classification["bd_rto"]),
         "other_delivered_amt": sum_amt(classification["other_delivered"]),
         "other_rto_amt": sum_amt(classification["other_rto"]),
+        "unknown_amt": sum_amt(classification["unknown"]),
         "prepaid_count": int((orders_df["Financial Status"] == "paid").sum()),
         "prepaid_amt": round(
             float(pd.to_numeric(
@@ -968,6 +1195,9 @@ def main():
     # Product-wise P&L (delivered orders only)
     pnl_rows = build_product_pnl(raw_fulfilled, classification, cfg["product_costs"])
 
+    # Prepaid vs COD delivery/RTO behaviour
+    payment_split = build_payment_split(orders_df, classification)
+
     # Build workbook
     wb = Workbook()
     ws_o = wb.active; ws_o.title = "Orders"
@@ -983,8 +1213,9 @@ def main():
     write_other_status(ws_x, other_rows, assumed)
     write_product_cost(ws_p, pc_data)
     write_delivery_analysis(ws_d, rollup_len)
-    populate_total_qty(ws_d, raw_fulfilled, rollup_products)
-    write_reconciliation(ws_r, totals, totals_cls, orders_df, pc_total_row)
+    populate_unit_counts(ws_d, raw_fulfilled, rollup_products, classification)
+    write_reconciliation(ws_r, totals, totals_cls, orders_df, pc_total_row,
+                         payment_split)
     write_pnl(ws_pnl, pnl_rows)
 
     out_path = outdir / f"{month_name}_{year}_{store_name}_ORDERS.xlsx"
@@ -999,6 +1230,13 @@ def main():
           f"  (incl {len(assumed)} paid-no-status assumed-delivered)")
     print(f"  Bluedart RTO               : {totals_cls['bd_rto']}")
     print(f"  Other RTO                  : {totals_cls['other_rto']}")
+    print(f"  Unknown / in transit       : {totals_cls['unknown']}")
+    for label in ("Prepaid", "COD"):
+        d = payment_split[label]
+        settled = d["delivered"] + d["rto"]
+        pct = d["rto"] / settled * 100 if settled else 0
+        print(f"  {label:<8} delivered {d['delivered']:>4}  RTO {d['rto']:>4}"
+              f"  unknown {d['unknown']:>3}  RTO% (settled) {pct:.2f}")
     print(f"  Total Sales (raw)          : {totals['total_sales_raw']}")
     print(f"  After Cancellation Sales   : {totals['after_cancellation_sales']}")
     print(f"\nWrote: {out_path}")
