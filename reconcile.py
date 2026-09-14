@@ -794,12 +794,14 @@ def write_pnl(ws, pnl_rows):
         ws.cell(extra_row, 10, f"=-I{extra_row}")              # col J: Profit/Loss (negative deduction)
         total_row += 1
         ws.cell(total_row, 1, "TOTAL").font = HEADER_FONT
-        for col in (2, 3, 4, 6, 7, 8, 9, 12):
+        for col in (2, 3, 4, 6, 7, 12):
             c = get_column_letter(col)
             ws.cell(total_row, col, f"=SUM({c}{start}:{c}{last})").font = HEADER_FONT
-        # col 10 (Profit/Loss) includes the extra row
-        ws.cell(total_row, 10,
-                f"=SUM(J{start}:J{total_row - 1})").font = HEADER_FONT
+        # cols 8/9 (Meta Spend, +GST) and 10 (Profit/Loss) include the extra row
+        for col in (8, 9, 10):
+            c = get_column_letter(col)
+            ws.cell(total_row, col,
+                    f"=SUM({c}{start}:{c}{extra_row})").font = HEADER_FONT
         ws.cell(total_row, 11,
                 f"=IFERROR(J{total_row}/D{total_row}*100,0)").font = HEADER_FONT
         tot_pct_del = round(tot_paid / tot_delivered_orders * 100, 2) if tot_delivered_orders else 0
