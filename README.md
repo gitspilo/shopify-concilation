@@ -10,15 +10,28 @@ and reference values.
 reconcile.py                 ← the script (same for all stores)
 stores/
   KUDBI.json                 ← KUDBI store config
-  KANTHA.json                ← (when you add a new store, drop a JSON here)
+  SOFTSTITCH.json            ← SOFTSTITCH store config
   _TEMPLATE.json             ← copy this to create a new store
 ```
+
+## Operational cost calculator
+
+Splits shared fixed costs (rent, light bill, salary) across brands by order volume and shows the per-parcel cost for each brand.
+
+```bash
+python operation_cost.py
+```
+
+The script prompts for fixed costs and brand order counts. Previously entered values are shown as defaults — just press Enter to keep them.
 
 ## How to run
 
 ```bash
 # For KUDBI:
-python reconcile.py --store KUDBI --inputs-dir ./input
+python reconcile.py --store KUDBI --inputs-dir ./input_aug_kudbi
+
+# For SOFTSTITCH:
+python reconcile.py --store SOFTSTITCH --inputs-dir ./input_aug_soft
 
 # For a new store (after creating stores/KANTHA.json):
 python reconcile.py --store KANTHA --inputs-dir ./kantha_april

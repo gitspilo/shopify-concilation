@@ -239,6 +239,16 @@ def dedupe_other_rows(rows):
 
 def build_other_status(expressfly_csv):
     df = pd.read_csv(expressfly_csv, dtype=str)
+    # Normalise column names: support both old and new Expressfly export formats
+    col_aliases = {
+        "Order ID":                    "Order Number",
+        "AWB":                         "Airwaybill Number",
+        "Courier":                     "Courier Name",
+        "Ready To Ship Date":          "Order Date",
+        "Service Provider NDR Comment":"Service Provider Comment",
+        "Number of Attempt":           "No of Attempt",
+    }
+    df = df.rename(columns={k: v for k, v in col_aliases.items() if k in df.columns})
     keep = ["Order Number", "Order Status", "Airwaybill Number", "Courier Name",
             "Order Date", "Service Provider Comment", "No of Attempt", "Zone"]
     df = df[keep].copy()
@@ -776,10 +786,20 @@ def write_pnl(ws, pnl_rows):
 
     if pnl_rows:
         last = total_row - 1
+        # Extra row before TOTAL for Meta spend on Insta/Website traffic
+        extra_row = total_row
+        ws.cell(extra_row, 1, "Meta Extra (Insta/Website)").font = HEADER_FONT
+        ws.cell(extra_row, 8, None).fill = YELLOW              # col H: Meta Spend (manual, excl GST)
+        ws.cell(extra_row, 9, f"=H{extra_row}*1.18")           # col I: +18% GST auto
+        ws.cell(extra_row, 10, f"=-I{extra_row}")              # col J: Profit/Loss (negative deduction)
+        total_row += 1
         ws.cell(total_row, 1, "TOTAL").font = HEADER_FONT
-        for col in (2, 3, 4, 6, 7, 8, 9, 10, 12):
+        for col in (2, 3, 4, 6, 7, 8, 9, 12):
             c = get_column_letter(col)
             ws.cell(total_row, col, f"=SUM({c}{start}:{c}{last})").font = HEADER_FONT
+        # col 10 (Profit/Loss) includes the extra row
+        ws.cell(total_row, 10,
+                f"=SUM(J{start}:J{total_row - 1})").font = HEADER_FONT
         ws.cell(total_row, 11,
                 f"=IFERROR(J{total_row}/D{total_row}*100,0)").font = HEADER_FONT
         tot_pct_del = round(tot_paid / tot_delivered_orders * 100, 2) if tot_delivered_orders else 0
@@ -1094,12 +1114,17 @@ def main():
     outdir = Path(args.output_dir)
     outdir.mkdir(parents=True, exist_ok=True)
 
+    # Support both shopify_orders.csv and orders_export*.csv filenames
     shopify_csv = indir / "shopify_orders.csv"
+    if not shopify_csv.exists():
+        candidates = sorted(indir.glob("orders_export*.csv"))
+        if candidates:
+            shopify_csv = candidates[0]
     expressfly_csv = indir / "expressfly.csv"
     bluedart_files = sorted(indir.glob("bluedart*.xlsx"))
     delivery_files = sorted(indir.glob("delivery*.xlsx"))
 
-    for path, label in [(shopify_csv, "shopify_orders.csv"),
+    for path, label in [(shopify_csv, shopify_csv.name),
                         (expressfly_csv, "expressfly.csv")]:
         if not path.exists():
             sys.exit(f"Missing input: {path}")
