@@ -4,8 +4,10 @@ operation_cost.py — Per-parcel operational cost calculator (multi-brand).
 Usage:
     python operation_cost.py
 
-Prompts for fixed costs and brand order counts, then splits costs
-proportionally and shows per-parcel cost for each brand.
+Prompts for fixed costs and, per brand, the orders dispatched and the
+shipments delivered. Costs are split by dispatched share (an RTO parcel
+costs the same to pack and ship as a delivered one), then shown both per
+dispatched parcel and per delivered parcel.
 """
 
 def ask_float(prompt, default=None):
@@ -43,6 +45,27 @@ def ask_yes_no(prompt, default=True):
         print("  Please answer y or n.")
 
 
+def ask_brand(name, default_orders=None, default_delivered=None):
+    """Dispatched and delivered counts for one brand.
+
+    Delivered can't exceed dispatched, so re-ask instead of letting a typo
+    through into a per-delivered figure that reads lower than it should.
+    """
+    while True:
+        orders = ask_int(f"    Orders dispatched for {name}", default_orders)
+        if orders < 0:
+            print("    Can't be negative.")
+            continue
+        delivered = ask_int(f"    Shipments delivered for {name}", default_delivered)
+        if delivered < 0:
+            print("    Can't be negative.")
+            continue
+        if delivered > orders:
+            print(f"    Delivered ({delivered}) can't exceed dispatched ({orders}).")
+            continue
+        return {"orders": orders, "delivered": delivered}
+
+
 def run():
     print()
     print("=" * 60)
@@ -62,16 +85,22 @@ def run():
     }
 
     # ── Brands ───────────────────────────────────────────────────
-    print("\n── Brands & Dispatched Orders ──")
+    print("\n── Brands: Dispatched & Delivered ──")
     print("  Each known brand is offered in turn; answer n to leave one out.")
-    print("  After those, you're asked whether to add any further brands.\n")
+    print("  After those, you're asked whether to add any further brands.")
+    print("  Both counts come from the reconcile.py summary: fulfilled orders,")
+    print("  and Bluedart delivered + Other delivered.\n")
     brands = {}
 
-    # Known brands, with last-run order counts as defaults
-    known = [("KUDBI", 2857), ("SOFTSTITCH", 198), ("KANTHAKALA", 32)]
-    for name, default_orders in known:
+    # Known brands, with last-run counts as defaults: (dispatched, delivered)
+    known = [
+        ("KUDBI",      2857, 1819),
+        ("SOFTSTITCH",  198, None),
+        ("KANTHAKALA",   32,   16),
+    ]
+    for name, default_orders, default_delivered in known:
         if ask_yes_no(f"  Include {name}?"):
-            brands[name] = ask_int(f"    Orders dispatched for {name}", default_orders)
+            brands[name] = ask_brand(name, default_orders, default_delivered)
 
     # Any brand not in the list above
     while True:
@@ -87,21 +116,33 @@ def run():
         if name in brands:
             print(f"    {name} is already entered.")
             continue
-        brands[name] = ask_int(f"    Orders dispatched for {name}")
+        brands[name] = ask_brand(name)
 
     # ── Calculation ──────────────────────────────────────────────
-    total_orders = sum(brands.values())
+    # Costs split by DISPATCHED share: an RTO parcel costs the same to pack,
+    # store and hand to the courier as one that lands.
+    total_orders    = sum(b["orders"] for b in brands.values())
+    total_delivered = sum(b["delivered"] for b in brands.values())
     if total_orders <= 0:
-        print("\n  Total orders is 0 — nothing to split. Re-run with real counts.")
+        print("\n  Total dispatched orders is 0 — nothing to split."
+              " Re-run with real counts.")
         return
     total_fixed  = sum(fixed_costs.values())
     brand_names  = list(brands.keys())
     col_w = 16
+    width = 14 + col_w * (1 + len(brand_names))
+
+    def row(label, total, values, fmt=",.2f"):
+        print(f"{label:<14}", end="")
+        print(f"{total:>{col_w}{fmt}}" if total is not None else f"{'':>{col_w}}", end="")
+        for v in values:
+            print(f"{v:>{col_w}{fmt}}" if v is not None else f"{'—':>{col_w}}", end="")
+        print()
 
     print()
-    print("=" * (14 + col_w * (1 + len(brand_names))))
-    print(f"  COST SPLIT  |  Total orders: {total_orders}")
-    print("=" * (14 + col_w * (1 + len(brand_names))))
+    print("=" * width)
+    print(f"  COST SPLIT  |  Dispatched: {total_orders}  |  Delivered: {total_delivered}")
+    print("=" * width)
 
     # Header row
     print(f"{'Cost Head':<14}", end="")
@@ -109,41 +150,54 @@ def run():
     for b in brand_names:
         print(f"{b:>{col_w}}", end="")
     print()
-    print("-" * (14 + col_w * (1 + len(brand_names))))
+    print("-" * width)
+
+    # Volume rows
+    row("Dispatched", total_orders, [brands[b]["orders"] for b in brand_names], fmt=",d")
+    row("Delivered", total_delivered, [brands[b]["delivered"] for b in brand_names], fmt=",d")
+    row("Delivery%",
+        total_delivered / total_orders * 100,
+        [brands[b]["delivered"] / brands[b]["orders"] * 100 if brands[b]["orders"] else None
+         for b in brand_names])
+    print("-" * width)
 
     brand_totals = {b: 0.0 for b in brand_names}
 
     for cost_name, amount in fixed_costs.items():
-        print(f"{cost_name:<14}", end="")
-        print(f"{amount:>{col_w},.2f}", end="")
+        shares = []
         for b in brand_names:
-            share = amount * brands[b] / total_orders
+            share = amount * brands[b]["orders"] / total_orders
             brand_totals[b] += share
-            print(f"{share:>{col_w},.2f}", end="")
-        print()
+            shares.append(share)
+        row(cost_name, amount, shares)
 
-    # Total row
-    print("-" * (14 + col_w * (1 + len(brand_names))))
-    print(f"{'TOTAL':<14}", end="")
-    print(f"{total_fixed:>{col_w},.2f}", end="")
-    for b in brand_names:
-        print(f"{brand_totals[b]:>{col_w},.2f}", end="")
-    print()
+    print("-" * width)
+    row("TOTAL", total_fixed, [brand_totals[b] for b in brand_names])
 
-    # Per-parcel row
-    print("-" * (14 + col_w * (1 + len(brand_names))))
-    print(f"{'Per Parcel':<14}", end="")
-    print(f"{'':>{col_w}}", end="")
-    for b in brand_names:
-        per_parcel = brand_totals[b] / brands[b]
-        print(f"{per_parcel:>{col_w},.2f}", end="")
-    print()
+    # Per-parcel rows. Per-dispatched is the same for every brand by
+    # construction (cost split by order share, divided by that share again);
+    # per-delivered is the one that varies — an RTO-heavy brand carries the
+    # cost of parcels that earned nothing.
+    print("-" * width)
+    row("Per Dispatch", None,
+        [brand_totals[b] / brands[b]["orders"] if brands[b]["orders"] else None
+         for b in brand_names])
+    row("Per Delivered", None,
+        [brand_totals[b] / brands[b]["delivered"] if brands[b]["delivered"] else None
+         for b in brand_names])
+    print("=" * width)
 
-    print("=" * (14 + col_w * (1 + len(brand_names))))
     print()
-    print("  Share basis:")
+    print("  Share basis (dispatched orders):")
     for b in brand_names:
-        print(f"    {b}: {brands[b]} orders ({brands[b]/total_orders*100:.1f}%)")
+        d = brands[b]
+        pct = d["orders"] / total_orders * 100
+        print(f"    {b}: {d['orders']} dispatched ({pct:.1f}%),"
+              f" {d['delivered']} delivered")
+    zero = [b for b in brand_names if not brands[b]["delivered"]]
+    if zero:
+        print(f"\n  No delivered shipments for {', '.join(zero)}"
+              f" — per-delivered shown as '—'.")
     print()
 
 if __name__ == "__main__":
