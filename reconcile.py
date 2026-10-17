@@ -13,8 +13,9 @@ To onboard a new store, copy stores/_TEMPLATE.json to stores/<STORE>.json and ed
 Inputs (in --inputs-dir):
   shopify_orders.csv
   bluedart*.xlsx   (one or more)
-  expressfly.csv
+  expressfly.csv   (optional)
   delivery*.xlsx   (optional, one or more — Delhivery-style tracking export)
+  shipclues*.csv   (optional, one or more — Shipclues panel export)
 
 Output:
   /mnt/user-data/outputs/<MONTH>_<YEAR>_<STORE>_ORDERS.xlsx
@@ -171,6 +172,11 @@ def parse_date(v):
             return datetime.strptime(s, fmt)
         except ValueError:
             continue
+    # ISO 8601 timestamp (Shipclues writes '2026-10-14T12:32:24.764950')
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        pass
     return s
 
 
@@ -306,18 +312,106 @@ def build_delivery_status(delivery_paths):
     return dedupe_other_rows(rows)
 
 
-def merge_other_status(expressfly_rows, delivery_rows):
+# Shipclues writes its own lowercase status vocabulary. Map it onto the same
+# words the other "Other" sources use so is_other_delivered / is_other_rto
+# classify Shipclues rows without a second set of rules.
+SHIPCLUES_STATUS_MAP = {
+    "delivered":        "Delivered",
+    "rto_delivered":    "RTO Delivered",
+    "rto_in_transit":   "RTO In Transit",
+    "rto_initiated":    "RTO Initiated",
+    "rto":              "RTO",
+    "in_transit":       "In Transit",
+    "ofd":              "Out For Delivery",
+    "ndr":              "NDR",
+    "pickup_pending":   "Pickup Pending",
+    "picked_up":        "Picked Up",
+    "cancelled":        "Cancelled",
+    "lost":             "Lost",
+}
+
+
+def map_shipclues_status(raw):
+    """Shipclues status -> the Other-courier vocabulary.
+
+    An unmapped status keeps its own words (underscores to spaces) rather than
+    being dropped, so a new Shipclues status still reads sensibly in the sheet;
+    one containing 'rto' still classifies as a return.
     """
-    Combine expressfly + delivery rows, one row per order number.
-    A definite status (Delivered / RTO) beats an in-flight one, otherwise the
-    first source seen (expressfly) wins.
+    s = clean_str(raw)
+    if not s:
+        return None
+    key = s.strip().lower()
+    if key in SHIPCLUES_STATUS_MAP:
+        return SHIPCLUES_STATUS_MAP[key]
+    return s.replace("_", " ").title()
+
+
+def build_shipclues_status(shipclues_paths):
+    """
+    Read shipclues*.csv (Shipclues panel export) into the same row shape as
+    build_other_status().
+
+    One export file per status bucket is the normal shape (in-transit,
+    delivered, returns), but the bucket is read from the 'status' column, not
+    the file name, so any split of the files works.
+
+    Only forward legs are read: a reverse-leg row carries the return shipment's
+    own status, and a delivered return leg would otherwise mark the order
+    Delivered.
+    """
+    rows = []
+    for p in shipclues_paths:
+        df = pd.read_csv(p, dtype=str, encoding="utf-8-sig")
+        if "order_type" in df.columns:
+            df = df[df["order_type"].fillna("Forward").str.strip().str.lower() == "forward"]
+
+        def col(name):
+            return df[name] if name in df.columns else pd.Series([None] * len(df), index=df.index)
+
+        attempt_cols = [c for c in ("first_ofd_date", "second_ofd_date", "third_ofd_date")
+                        if c in df.columns]
+        attempts = (df[attempt_cols].notna().sum(axis=1)
+                    if attempt_cols else pd.Series([0] * len(df), index=df.index))
+
+        order_no = col("order_number")
+        if order_no.isna().all():
+            order_no = col("customer_order_number")
+        pickup = col("pickup_date").fillna(col("shipped_date")).fillna(col("order_date"))
+
+        for i in df.index:
+            ord_no = normalize_order_no(order_no.get(i))
+            if ord_no is None:
+                continue
+            n_att = int(attempts.get(i) or 0)
+            courier = clean_str(col("courier_name").get(i))
+            rows.append([
+                ord_no,
+                map_shipclues_status(col("status").get(i)),
+                strip_hash(col("awb_number").get(i)),
+                f"SHIPCLUES ({courier})" if courier else "SHIPCLUES",
+                parse_date(pickup.get(i)),
+                clean_str(col("ndr_reason").get(i)),
+                n_att or None,
+                clean_str(col("zone").get(i)),
+            ])
+    return dedupe_other_rows(rows)
+
+
+def merge_other_status(*sources):
+    """
+    Combine the Other-courier sources (expressfly, delivery, shipclues) into
+    one row per order number. A definite status (Delivered / RTO) beats an
+    in-flight one, otherwise the first source seen wins — so pass the sources
+    in priority order, expressfly first.
     """
     def definite(status):
         return is_other_delivered(status) or is_other_rto(status)
 
     merged = {}
     order = []
-    for row in list(expressfly_rows) + list(delivery_rows):
+    all_rows = [row for src in sources for row in (src or [])]
+    for row in all_rows:
         n = row[0]
         if n not in merged:
             merged[n] = row
@@ -1102,7 +1196,8 @@ def main():
     ap.add_argument("--store", required=True,
                     help="Store identifier (matches stores/<STORE>.json)")
     ap.add_argument("--inputs-dir", default=".",
-                    help="Folder containing shopify_orders.csv, bluedart*.xlsx, expressfly.csv")
+                    help="Folder containing shopify_orders.csv, bluedart*.xlsx, "
+                         "expressfly.csv, and optionally delivery*.xlsx / shipclues*.csv")
     ap.add_argument("--output-dir", default=str(here / "output"))
     ap.add_argument("--stores-dir", default=str(here / "stores"))
     ap.add_argument("--month", help="Override month name (e.g. APRIL)")
@@ -1125,30 +1220,43 @@ def main():
     expressfly_csv = indir / "expressfly.csv"
     bluedart_files = sorted(indir.glob("bluedart*.xlsx"))
     delivery_files = sorted(indir.glob("delivery*.xlsx"))
+    shipclues_files = sorted(indir.glob("shipclues*.csv"))
 
-    for path, label in [(shopify_csv, shopify_csv.name),
-                        (expressfly_csv, "expressfly.csv")]:
-        if not path.exists():
-            sys.exit(f"Missing input: {path}")
+    if not shopify_csv.exists():
+        sys.exit(f"Missing input: {shopify_csv}")
     if not bluedart_files:
         sys.exit(f"No bluedart*.xlsx files in {indir}")
 
     print(f"[{store_name}] inputs:")
     print(f"  shopify   : {shopify_csv.name}")
-    print(f"  expressfly: {expressfly_csv.name}")
+    print(f"  expressfly: {expressfly_csv.name if expressfly_csv.exists() else 'none'}")
     print(f"  bluedart  : {[p.name for p in bluedart_files]}")
     print(f"  delivery  : {[p.name for p in delivery_files] or 'none'}")
+    print(f"  shipclues : {[p.name for p in shipclues_files] or 'none'}")
 
     # Read data
     shopify_df_raw = pd.read_csv(shopify_csv, dtype=str)
     orders_df, raw_fulfilled, totals = build_orders(shopify_csv)
     bd_rows = build_bluedart_status(bluedart_files)
-    expressfly_rows = build_other_status(expressfly_csv)
+    expressfly_rows = build_other_status(expressfly_csv) if expressfly_csv.exists() else []
     delivery_rows = build_delivery_status(delivery_files) if delivery_files else []
-    other_rows = merge_other_status(expressfly_rows, delivery_rows)
-    if delivery_files:
-        print(f"  delivery rows: {len(delivery_rows)}"
-              f" (Other status rows after merge: {len(other_rows)})")
+    shipclues_rows = build_shipclues_status(shipclues_files) if shipclues_files else []
+    other_rows = merge_other_status(expressfly_rows, delivery_rows, shipclues_rows)
+    if delivery_files or shipclues_files:  # extra Other sources beyond expressfly
+        if delivery_files:
+            print(f"  delivery rows : {len(delivery_rows)}")
+        if shipclues_files:
+            print(f"  shipclues rows: {len(shipclues_rows)}")
+        print(f"  Other status rows after merge: {len(other_rows)}")
+        # A courier export covering a different month than the Shopify export
+        # matches nothing and would otherwise fail silently.
+        order_names = set(orders_df["Name"].tolist())
+        for label, rows in (("delivery", delivery_rows), ("shipclues", shipclues_rows)):
+            if rows and not any(r[0] in order_names for r in rows):
+                print(f"  WARNING: none of the {len(rows)} {label} orders match a fulfilled"
+                      f" Shopify order in {shopify_csv.name} — check the files are from"
+                      f" the same month (order numbers"
+                      f" {min(str(r[0]) for r in rows)}-{max(str(r[0]) for r in rows)})")
 
     # Register products seen this month but missing from the store config
     seen_products = {
