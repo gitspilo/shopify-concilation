@@ -30,6 +30,19 @@ def ask_int(prompt, default=None):
         except ValueError:
             print("  Please enter a valid whole number.")
 
+def ask_yes_no(prompt, default=True):
+    suffix = " [Y/n]" if default else " [y/N]"
+    while True:
+        val = input(f"{prompt}{suffix}: ").strip().lower()
+        if val == "":
+            return default
+        if val in ("y", "yes"):
+            return True
+        if val in ("n", "no"):
+            return False
+        print("  Please answer y or n.")
+
+
 def run():
     print()
     print("=" * 60)
@@ -50,31 +63,37 @@ def run():
 
     # ── Brands ───────────────────────────────────────────────────
     print("\n── Brands & Dispatched Orders ──")
+    print("  Each known brand is offered in turn; answer n to leave one out.")
+    print("  After those, you're asked whether to add any further brands.\n")
     brands = {}
-    print("  Enter brand names and order counts.")
-    print("  Press Enter with blank name when done.\n")
 
-    # Pre-fill last known values as defaults
-    defaults = [("KUDBI", 2496), ("SOFTSTITCH", 198)]
-    idx = 0
+    # Known brands, with last-run order counts as defaults
+    known = [("KUDBI", 2857), ("SOFTSTITCH", 198), ("KANTHAKALA", 32)]
+    for name, default_orders in known:
+        if ask_yes_no(f"  Include {name}?"):
+            brands[name] = ask_int(f"    Orders dispatched for {name}", default_orders)
+
+    # Any brand not in the list above
     while True:
-        default_name = defaults[idx][0] if idx < len(defaults) else ""
-        name_suffix  = f" [{default_name}]" if default_name else ""
-        name = input(f"  Brand name{name_suffix}: ").strip()
-        if name == "":
-            name = default_name
-        if name == "":
-            if len(brands) >= 1:
+        if not ask_yes_no("\n  Add another brand?", default=False):
+            if brands:
                 break
             print("  At least one brand is required.")
             continue
-        default_orders = defaults[idx][1] if idx < len(defaults) else None
-        orders = ask_int(f"  Orders dispatched for {name}", default_orders)
-        brands[name] = orders
-        idx += 1
+        name = input("    Brand name: ").strip()
+        if not name:
+            print("    Brand name can't be blank.")
+            continue
+        if name in brands:
+            print(f"    {name} is already entered.")
+            continue
+        brands[name] = ask_int(f"    Orders dispatched for {name}")
 
     # ── Calculation ──────────────────────────────────────────────
     total_orders = sum(brands.values())
+    if total_orders <= 0:
+        print("\n  Total orders is 0 — nothing to split. Re-run with real counts.")
+        return
     total_fixed  = sum(fixed_costs.values())
     brand_names  = list(brands.keys())
     col_w = 16

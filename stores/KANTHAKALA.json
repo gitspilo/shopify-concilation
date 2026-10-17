@@ -1,0 +1,10 @@
+{
+  "store_name": "KANTHAKALA",
+  "product_costs": {
+    "_INSTRUCTIONS_": "Add 'Parent Product Name': cost_in_INR entries below. Parent name = the lineitem name BEFORE the ' - ' separator (e.g. 'Juhi Heavy Fancy Pair with Dupatta set'). Products without a cost here will appear in the output with a yellow-highlighted blank cost cell.",
+    "Chitra Heavy Fancy Pair with Dupatta set": 550,
+    "Fila fancy Kalamkari kurta set for women": 450,
+    "Filora Fancy Cotton Kurta Set for Women": 450,
+    "jisora Heavy Fancy Black Co-ords set": 450
+  }
+}

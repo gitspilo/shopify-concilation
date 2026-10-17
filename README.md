@@ -11,6 +11,7 @@ reconcile.py                 ← the script (same for all stores)
 stores/
   KUDBI.json                 ← KUDBI store config
   SOFTSTITCH.json            ← SOFTSTITCH store config
+  KANTHAKALA.json            ← KANTHAKALA store config
   _TEMPLATE.json             ← copy this to create a new store
 ```
 
@@ -28,22 +29,43 @@ The script prompts for fixed costs and brand order counts. Previously entered va
 
 ```bash
 # For KUDBI:
-python reconcile.py --store KUDBI --inputs-dir ./input_aug_kudbi
+python reconcile.py --store KUDBI --inputs-dir ./input_sep_kudbi
 
 # For SOFTSTITCH:
 python reconcile.py --store SOFTSTITCH --inputs-dir ./input_aug_soft
 
 # For a new store (after creating stores/KANTHA.json):
-python reconcile.py --store KANTHA --inputs-dir ./kantha_april
+python reconcile.py --store KANTHAKALA --inputs-dir ./input_sep_kantha
 
 # Override month/year if auto-detection picks wrong:
 python reconcile.py --store KUDBI --inputs-dir . --month MAY --year 2026
 ```
 
 Each `--inputs-dir` folder must contain:
-- `shopify_orders.csv`
+- `shopify_orders.csv` (or `orders_export*.csv`)
 - `bluedart*.xlsx` (one or more files)
-- `expressfly.csv`
+
+and may also contain:
+- `expressfly.csv` (a store shipping only via Bluedart doesn't need one)
+- `delivery*.xlsx` (one or more — Delhivery-style tracking export)
+- `shipclues*.csv` (one or more — Shipclues panel export)
+
+### Shipclues files
+
+The Shipclues panel exports one file per status bucket — in-transit, delivered,
+returns. Drop all of them in the folder with any names starting `shipclues`;
+the script reads the bucket from each row's `status` column, so the file names
+don't matter. Shipclues rows join Expressfly and Delhivery in the **Other**
+courier column: `delivered` counts as Other Delivered, any `rto_*` status as
+Other RTO.
+
+Only forward legs (`order_type = Forward`) are read — a reverse leg carries the
+return shipment's own status, and a delivered return leg would otherwise mark
+the order as Delivered.
+
+All courier files must cover the same month as the Shopify export. If none of
+the Shipclues orders match a fulfilled Shopify order, the script prints a
+WARNING with the order-number range so you can spot a mismatched file.
 
 Output goes to `/mnt/user-data/outputs/<MONTH>_<YEAR>_<STORE>_ORDERS.xlsx`.
 
@@ -51,7 +73,9 @@ Output goes to `/mnt/user-data/outputs/<MONTH>_<YEAR>_<STORE>_ORDERS.xlsx`.
 
 1. Copy `stores/_TEMPLATE.json` to `stores/<NEW_STORE>.json`
 2. Set `store_name` to the new store's name
-3. Fill in `product_costs` with all parent product names and their per-piece costs
+3. Fill in `product_costs` with all parent product names and their per-piece costs,
+   or leave it empty — the first run adds every product it sees with a `null`
+   cost, and you fill the numbers in afterwards
 4. Optionally update `sample_trible` reference values
 
 That's it — no script changes needed.
